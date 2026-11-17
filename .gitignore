@@ -23,3 +23,9 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Local render-farm runtime data and reproducible preview exports
+/render_farm/farm_data/
+/render_farm/farm_data_demo/
+/render_farm/preview.png
+/render_farm/preview_demo.png

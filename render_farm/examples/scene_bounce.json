@@ -1,0 +1,36 @@
+{
+  "scene_id": "bounce_shot_01",
+  "total_frames": 12,
+  "background": {
+    "top": [16, 24, 46],
+    "bottom": [92, 138, 188]
+  },
+  "ground": {"y": 0.18, "color": [38, 62, 46]},
+  "objects": [
+    {
+      "id": "red_ball",
+      "type": "circle",
+      "radius": 0.075,
+      "color": [224, 86, 72],
+      "path": {
+        "start": [0.12, 0.62],
+        "end": [0.88, 0.30],
+        "easing": "smooth",
+        "loop": false
+      }
+    },
+    {
+      "id": "drone",
+      "type": "rect",
+      "width": 0.09,
+      "height": 0.05,
+      "color": [240, 200, 92],
+      "path": {
+        "start": [0.85, 0.82],
+        "end": [0.15, 0.72],
+        "easing": "linear",
+        "loop": true
+      }
+    }
+  ]
+}
