@@ -86,13 +86,19 @@ class FarmClient:
         )
         return status == 200
 
-    def succeed(self, attempt_id: str, png: bytes) -> tuple[int, dict]:
+    def succeed(self, attempt_id: str, png: bytes,
+                render_ms: float | None = None,
+                meta: dict | None = None) -> tuple[int, dict]:
         req = urllib.request.Request(
             f"{self.base_url}/api/attempts/{attempt_id}/success",
             data=png, method="POST",
         )
         req.add_header("Content-Type", "image/png")
         req.add_header("X-Worker-Id", self.worker_id)
+        if render_ms is not None:
+            req.add_header("X-Render-Ms", f"{render_ms:.1f}")
+        if meta:
+            req.add_header("X-Worker-Meta", json.dumps(meta, sort_keys=True))
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = resp.read()
@@ -103,10 +109,13 @@ class FarmClient:
             except (ValueError, json.JSONDecodeError):
                 return exc.code, {"error": "unparseable error body"}
 
-    def fail(self, attempt_id: str, error: str) -> tuple[int, dict]:
+    def fail(self, attempt_id: str, error: str,
+             render_ms: float | None = None,
+             meta: dict | None = None) -> tuple[int, dict]:
         return self._request(
             "POST", f"/api/attempts/{attempt_id}/fail",
-            {"worker_id": self.worker_id, "error": error},
+            {"worker_id": self.worker_id, "error": error,
+             "render_ms": render_ms, "meta": meta},
         )
 
 
@@ -166,13 +175,18 @@ def worker_loop(base_url: str, name: str, lease_seconds: float = 10.0,
         attempt_id = task["attempt_id"]
         frame = int(task["frame"])
         settings = task["settings"]
+        render_started = time.perf_counter()
         try:
             scene_doc = client.scene_doc(task["scene_id"], task["version"])
             png = render_frame(scene_doc, frame, settings)
         except Exception as exc:  # render itself blew up: report and continue
-            client.fail(attempt_id, f"render error: {exc!r}")
+            client.fail(attempt_id, f"render error: {exc!r}",
+                        render_ms=(time.perf_counter() - render_started) * 1000)
             stats["failed"] += 1
             continue
+        render_ms = (time.perf_counter() - render_started) * 1000
+        meta = {"name": name, "pid": os.getpid(), "frame": frame,
+                "render_ms": round(render_ms, 1)}
 
         # --------------------------------------------------------- fault inject
         frame_matches = fault is not None and (
@@ -183,24 +197,29 @@ def worker_loop(base_url: str, name: str, lease_seconds: float = 10.0,
                 stats["crashed_frame"] = frame
                 os._exit(2)
             if fault["kind"] == "halfupload":
-                status, body = client.succeed(attempt_id, png[: len(png) // 2])
+                status, body = client.succeed(
+                    attempt_id, png[: len(png) // 2],
+                    render_ms=render_ms, meta=meta)
                 if status == 422:
                     stats["rejected"] += 1
                 continue
             if fault["kind"] == "failreport":
-                client.fail(attempt_id, "injected render failure")
+                client.fail(attempt_id, "injected render failure",
+                            render_ms=render_ms, meta=meta)
                 stats["failed"] += 1
                 continue
             if fault["kind"] == "stall":
                 time.sleep(lease_seconds * 1.6)
-                status, _ = client.succeed(attempt_id, png)
+                status, _ = client.succeed(attempt_id, png,
+                                           render_ms=render_ms, meta=meta)
                 stats["rejected"] += 1 if status == 409 else 0
                 continue
 
         hb = _Heartbeater(client, attempt_id, lease_seconds)
         hb.start()
         try:
-            status, body = client.succeed(attempt_id, png)
+            status, body = client.succeed(attempt_id, png,
+                                          render_ms=render_ms, meta=meta)
         finally:
             hb.stop_event.set()
         if status == 200:

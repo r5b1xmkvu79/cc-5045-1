@@ -45,6 +45,11 @@ def scene_version(scene_doc: dict) -> str:
     return sha256_hex(canonical_json(scene_doc))[:16]
 
 
+def frame_revision(scene_id: str, version: str, frame: int, s_hash: str) -> str:
+    """Human-readable frame identity (not hashed) recorded with adoptions."""
+    return f"{scene_id}|{version}|{frame:08d}|{s_hash}"
+
+
 def task_key(scene_id: str, version: str, frame: int, s_hash: str) -> str:
-    raw = f"{scene_id}|{version}|{frame:08d}|{s_hash}"
+    raw = frame_revision(scene_id, version, frame, s_hash)
     return sha256_hex(raw)[:32]

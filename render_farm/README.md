@@ -17,6 +17,9 @@
 | 失联/重复回报/重启不能让旧尝试覆盖新结果 | 回报只在“该 attempt 仍 active 且归该 worker 且任务仍由其租约持有”时接受；过期或重复的迟到回报统一 409；结果只记录在成功的 attempt 上 |
 | 未完成帧明确标记 | 未成功帧返回实时生成的斜纹占位 PNG（不同状态不同配色），HTTP 头 `X-Frame-Status` 标明状态；预览导出 JSON 同时列出 `marked_unfinished` |
 | 结果归属可追溯 | 每帧记录成功的 `worker_id`、`attempt_id`、blob sha256、场景版本、设置哈希、全部尝试历史 |
+| 采用决策可独立重放 | 每次结果采用/拒绝都写入 `adoptions` 表：含尝试代次（generation）、所属阶段、判定时的尝试与租约快照；`diagnostics.replay_adoption` 只用快照即可复算同一结论，不依赖实时数据库 |
+| 旧节点覆盖可定位到阶段 | 采用规则逐阶段校验 claim→report→lease_check→generation_check→validate→adopt；任一阶段拒绝都记录原因，异常定位到具体帧与阶段 |
+| 失联重试与逆序完成可区分 | 逆序完成：旧代次尝试状态为 superseded（阶段 report/lease_check）；失联重试：旧尝试阶段为 reaped；两种情形都保留代次与帧修订，诊断矩阵复跑结果一致 |
 | 不是固定图片轮播 | 每个缩略图都来自调度器逐帧接口；“顺序预览”按帧号拉取真实帧，占位图也是按状态实时生成 |
 | 不能只凭文件存在判定有效 | 正式帧只在完整解码+尺寸校验通过后写入；预览导出同样对每张图完整 `decode_png` |
 
@@ -24,16 +27,17 @@
 
 ```
 renderfarm/
-  identity.py     # 场景版本/设置哈希/任务键
+  identity.py     # 场景版本/设置哈希/帧修订/任务键
   png.py          # 纯标准库 PNG 编码 + 严格解码（CRC/截断/尺寸校验）
   renderer.py     # 真实 2D 光栅化：渐变背景、地面、运动圆形/矩形、SSAA
   placeholders.py # 未完成帧的状态占位图（生成，非静态素材）
-  storage.py      # SQLite 调度内核：提交/租约/心跳/回报/回收/取消/审计
+  storage.py      # SQLite 调度内核：提交/租约/心跳/回报/回收/取消/审计 + 采用决策证据
+  diagnostics.py  # 渲染归属诊断：采用决策重放、阶段定位、逆序/失联故障矩阵
   worker.py       # 本地工作进程：领取→渲染→心跳→上传，支持故障注入
-  web.py          # HTTP API + 调度面板页面
+  web.py          # HTTP API + 调度面板页面（含渲染归属诊断面板）
   preview.py      # 时间顺序预览拼版（未完成帧带标记）
 examples/scene_bounce.json   # 含运动物体的示例场景
-tests/test_core.py           # 21 项进程内单元测试
+tests/test_core.py           # 26 项进程内单元测试（含证据链与重放）
 tests/e2e_fault_matrix.py    # 真实子进程的故障矩阵端到端测试
 run_demo.sh                  # 一键演示
 ```
@@ -67,6 +71,49 @@ python3 -m renderfarm.worker --server http://127.0.0.1:8765 --name node-2
    来源 worker、正式 attempt、版本、设置哈希、blob 哈希；未完成帧显示斜纹占位而不是留空。
 4. “顺序预览”按钮按帧号顺序高亮轮播**当前真实帧**（再次点击停止）。
 5. 工作进程区显示在线/失联（按心跳时间）、完成数、失败数；下方是调度审计事件流。
+6. **渲染归属诊断**（第 5 区）：每帧缩略图下有“归属诊断”按钮。点击后展示：
+   帧修订、正式 worker 与代次、尝试执行证据（claim/render/report/validate/adopt
+   各阶段与耗时）、采用/拒绝决策及其原因、以及可独立重放的判定结果。
+   提交帧段或取消任务后，面板反馈区会逐帧给出“渲染帧 / 结果归属 / 原因”。
+   若诊断发现归属异常（如帧已被成功但无采用记录、帧修订不一致、判定不可重放），
+   界面底部横幅会提示具体帧与阶段；异常不会用默认值掩盖。
+
+## 渲染归属诊断（贯穿式追踪）
+
+每帧的身份是 `(scene_id, version, frame, settings_hash)`，其中 `frame_revision`
+是这四项的可读串（`identity.frame_revision`）。调度内核在**每次**结果采用时写入
+一条 `adoptions` 记录：
+
+* `generation`：该 attempt 领取时的任务代次（每次重新派发递增）；
+* `stage`：判定发生在 `report` / `lease_check` / `generation_check` / `validate` / `adopt` 哪个阶段；
+* `evidence`：判定瞬间的尝试状态、租约持有者、任务代次、帧修订与校验结果快照；
+* `decision` / `reason`：采用或拒绝及具体原因。
+
+“同一帧被旧工作节点覆盖”的排查路径：
+
+1. 逆序完成（旧节点最后才回报）：旧 attempt 已被新租约取代，阶段为
+   `report`/`lease_check`，代次为旧值 → **拒绝**，新代次结果保留。
+2. 失联重试（旧节点心跳停止、租约被回收后回报）：旧 attempt 阶段为 `reaped`
+   → **拒绝**，回收后由新代次重渲。
+3. 两者都以 `refused_by_stage`、`adopted_generation`、`frame_revision` 记录，
+   可直接对照区分，而不是先假定存储错误。
+
+诊断材料可独立重放：`adoptions` 记录里的 `evidence` 是自包含的，把记录导出为
+JSON 后，用 `renderfarm.diagnostics replay` 在不连数据库的情况下复算同一结论。
+
+```bash
+# 从调度器导出某个提交的全部采用决策（含证据快照）
+curl -s http://127.0.0.1:8765/api/submissions/<sub>/diagnostics/adoptions > /tmp/adoptions.json
+# 独立重放：退出码 0 表示所有判定可复算且一致
+python3 -m renderfarm.diagnostics replay /tmp/adoptions.json
+```
+
+CLI 的 `matrix` 子命令只用于复现/校核诊断逻辑，不取代面板：
+
+```bash
+# 逆序完成 + 失联重试两个场景，各重复 3 次，要求复跑判定完全一致
+python3 -m renderfarm.diagnostics matrix --repeat 3 --out /tmp/diag_report.json
+```
 
 ### 一键演示（含半张图注入与恢复）
 
@@ -107,11 +154,15 @@ python3 -m unittest tests.test_core -v
 
 # 完整端到端：真实调度器 + 多个故障 worker 子进程 + 调度器中途重启
 python3 tests/e2e_fault_matrix.py
+
+# 诊断逻辑自检：逆序完成/失联重试矩阵，多次复跑要求一致
+python3 -m renderfarm.diagnostics matrix --repeat 3
 ```
 
 端到端测试覆盖：崩溃恢复、半图拒绝后重试、失败回报、失联旧尝试 409、重复回报幂等、
 编辑后新版本不命中旧图、设置哈希隔离、取消标记、重启恢复，并对最终 12 帧逐张完整解码、
-校验尺寸、确认相邻帧像素不同且无重复/错帧。
+校验尺寸、确认相邻帧像素不同且无重复/错帧。另验证每帧的采用证据可重放、帧修订与
+正式结果一致，以及逆序完成/失联重试两类根因在多次复跑中判定稳定。
 
 ## 主要 HTTP API
 
@@ -120,7 +171,9 @@ python3 tests/e2e_fault_matrix.py
 | `POST /api/submissions` | 提交场景+帧段+设置，返回版本/设置哈希/新建与复用帧 |
 | `DELETE /api/submissions/{id}/cancel` | 取消提交 |
 | `GET  /api/submissions/{id}` | 任务列表、状态汇总、每帧归属与尝试历史 |
-| `GET  /api/submissions/{id}/frames/{n}` | 正式帧 PNG；未完成时为占位图（状态在 `X-Frame-Status`） |
+| `GET  /api/submissions/{id}/frames/{n}` | 正式帧 PNG；未完成时为占位图（状态在 `X-Frame-Status`，另有 `X-Frame-Revision`） |
+| `GET  /api/submissions/{id}/frames/{n}/diagnostics` | 该帧执行证据链：尝试阶段/代次/耗时、采用决策、阶段定位与异常 |
+| `GET  /api/submissions/{id}/diagnostics/adoptions` | 该提交全部采用决策及可重放结果（可导出为 JSON 独立复算） |
 | `POST /api/claim` | worker 领取任务（返回 attempt_id、租约到期时间、场景文档） |
 | `POST /api/heartbeat` | 续租 |
 | `POST /api/attempts/{id}/success` | 上传完整 PNG（`image/png`，worker 经 `X-Worker-Id` 标识） |

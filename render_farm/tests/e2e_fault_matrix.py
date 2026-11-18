@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from renderfarm.png import decode_png, PNGError  # noqa: E402
+from renderfarm import diagnostics  # noqa: E402
 
 PORT = 8811
 BASE = f"http://127.0.0.1:{PORT}"
@@ -141,8 +142,47 @@ def fetch_frame(sub_id: str, frame: int) -> tuple[dict, bytes]:
 # ----------------------------------------------------------------------------
 # Checks
 # ----------------------------------------------------------------------------
-def check_half_upload_rejected(data_dir: str) -> None:
-    # No blob file may be truncated: every stored blob must decode fully.
+def check_adoption_chains(sub_id: str, tasks: list[dict]) -> None:
+    """Every finished frame must carry an adopted decision that replays."""
+    for t in tasks:
+        status, _, d = api(
+            "GET", f"/api/submissions/{sub_id}/frames/{t['frame']}/diagnostics")
+        assert status == 200, status
+        chain = d["chain"]
+        assert chain["ok"], f"frame {t['frame']} chain anomalies: {chain['anomalies']}"
+        assert chain["frame_revision"], "frame revision missing"
+        assert chain["adopted_attempt"] == t["provenance"]["completed_attempt"]
+        assert chain["adopted_worker"] == t["provenance"]["completed_by"]
+        assert d["adoptions"], "no adoption rows"
+        for a in d["adoptions"]:
+            replayed = diagnostics.replay_adoption(a)
+            assert replayed["consistent"], (t["frame"], replayed)
+    # the submission-level export must replay too, without the live store
+    status, _, export = api("GET", f"/api/submissions/{sub_id}/diagnostics/adoptions")
+    assert status == 200
+    assert export["replayed"], "no replay results exported"
+    assert all(r["consistent"] for r in export["replayed"])
+    print(f"  [ok] {len(tasks)} frames: revision + adoption evidence replay cleanly")
+
+
+def check_staged_diagnostics() -> None:
+    """Reverse-order completion vs lost-node retry must stay deterministic."""
+    report = diagnostics.run_matrix(repeat=3)
+    assert report["all_consistent"], report["determinism"]
+    ooo, stall = report["scenarios"][0], report["scenarios"][1]
+    # out-of-order: the newer generation wins even though it finished first
+    assert ooo["newer_outcome"] == "ok" and ooo["older_outcome"] == "stale"
+    assert ooo["adopted_worker"] == "node-newer"
+    assert ooo["chain"]["refused_by_stage"] == {"report": 1}
+    # stale lease: the late report was refused because the attempt was reaped
+    assert stall["successor_outcome"] == "ok" and stall["late_outcome"] == "stale"
+    assert stall["adopted_worker"] == "node-successor"
+    assert ooo["chain"]["adopted_generation"] == 2
+    assert stall["chain"]["adopted_generation"] == 2
+    print("  [ok] reverse-order and stale-lease causes are distinguished")
+
+
+def check_half_upload_rejected(data_dir: str) -> None:    # No blob file may be truncated: every stored blob must decode fully.
     blob_root = os.path.join(data_dir, "blobs")
     count = 0
     for dirpath, _, files in os.walk(blob_root):
@@ -231,6 +271,13 @@ def main() -> None:
             assert any(a["state"] == "succeeded" for a in prov["attempts"])
         worker_ids = {w for t in detail["tasks"] for w in [t["provenance"]["completed_by"]]}
         print(f"  [ok] provenance present; frames produced by {len(worker_ids)} workers")
+
+        # --- Phase 1b: adoption evidence chain + staged diagnostics --------
+        print("\n=== Phase 1b: adoption evidence chain is replayable ===")
+        check("every frame has an accepted adoption that replays", lambda:
+              check_adoption_chains(sub_id, detail["tasks"]))
+        check("out-of-order vs stale-lease diagnostics are deterministic", lambda:
+              check_staged_diagnostics())
 
         # --- Phase 2: stale attempt / duplicate report cannot overwrite -----
         print("\n=== Phase 2: old attempts cannot overwrite new results ===")

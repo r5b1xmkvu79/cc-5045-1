@@ -259,5 +259,119 @@ class TestStoreLeaseLifecycle(unittest.TestCase):
         self.assertEqual(self.store.list_tasks("sub-1")[0]["status"], "failed")
 
 
+class TestAdoptionEvidence(unittest.TestCase):
+    """Every adoption decision must carry a replayable evidence snapshot."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="farm-diag-")
+        self.store = FarmStore(self.dir)
+        self.scene = _scene()
+        self.store.create_submission("sub-d", self.scene, DEFAULT_SETTINGS, 0, 0)
+        self.tkey = self.store.list_tasks("sub-d")[0]["task_key"]
+        self.png = render_frame(self.scene, 0, DEFAULT_SETTINGS)
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_accepted_adoption_replays_consistently(self):
+        task = self.store.claim_task("node-A", 30, now=100.0)
+        self.assertEqual(
+            self.store.succeed_attempt(task["attempt_id"], "node-A", self.png,
+                                       now=101.0,
+                                       worker_meta={"name": "node-A"}),
+            "ok")
+        adoptions = self.store.adoptions_for_task(self.tkey)
+        self.assertEqual(len(adoptions), 1)
+        a = adoptions[0]
+        self.assertEqual(a["decision"], "accepted")
+        self.assertEqual(a["stage"], "adopt")
+        self.assertEqual(a["generation"], 1)
+        self.assertTrue(a["frame_revision"].startswith("unit_scene|"))
+        replayed = self.store.replay_adoption(a)
+        self.assertTrue(replayed["consistent"], replayed)
+        self.assertTrue(all(r["pass"] for r in replayed["rules"]))
+
+    def test_refused_report_records_superseded_attempt(self):
+        old = self.store.claim_task("node-old", 1.0, now=100.0)
+        self.store.reap_expired(now=102.0)
+        new = self.store.claim_task("node-new", 30.0, now=103.0)
+        # older node finishes last (reverse completion) but is superseded
+        self.assertEqual(
+            self.store.succeed_attempt(new["attempt_id"], "node-new", self.png,
+                                       now=104.0), "ok")
+        self.assertEqual(
+            self.store.succeed_attempt(old["attempt_id"], "node-old", self.png,
+                                       now=105.0), "stale")
+        adoptions = self.store.adoptions_for_task(self.tkey)
+        refusals = [a for a in adoptions if a["decision"] == "refused"]
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["stage"], "report")
+        self.assertIn("superseded", refusals[0]["reason"])
+        for a in adoptions:
+            self.assertTrue(self.store.replay_adoption(a)["consistent"], a)
+        # the newer generation stays the adopted result
+        from renderfarm.diagnostics import diagnose_chain
+        chain = diagnose_chain(self.store.get_task(self.tkey),
+                               self.store.attempt_trace(self.tkey), adoptions)
+        self.assertTrue(chain["ok"], chain["anomalies"])
+        self.assertEqual(chain["adopted_generation"], 2)
+        self.assertEqual(chain["adopted_worker"], "node-new")
+
+    def test_stale_lease_reason_differs_from_ordering(self):
+        old = self.store.claim_task("stalled", 1.0, now=200.0)
+        self.store.reap_expired(now=202.0)
+        new = self.store.claim_task("successor", 30.0, now=203.0)
+        self.store.succeed_attempt(new["attempt_id"], "successor", self.png,
+                                   now=204.0)
+        self.store.succeed_attempt(old["attempt_id"], "stalled", self.png,
+                                   now=205.0)
+        attempts = self.store.attempt_trace(self.tkey)
+        self.assertEqual(
+            [a["phase"] for a in attempts if a["state"] == "superseded"],
+            ["reaped"])
+        self.assertEqual(
+            [a["phase"] for a in attempts if a["adopted"]], ["adopt"])
+
+    def test_invalid_image_refusal_is_replayable(self):
+        task = self.store.claim_task("node-A", 30, now=100.0)
+        self.assertEqual(
+            self.store.succeed_attempt(task["attempt_id"], "node-A",
+                                       self.png[: len(self.png) // 2],
+                                       now=101.0), "invalid")
+        a = self.store.adoptions_for_task(self.tkey)[-1]
+        self.assertEqual(a["decision"], "refused")
+        self.assertEqual(a["stage"], "validate")
+        self.assertFalse(a["evidence"]["validation_ok"])
+        self.assertTrue(self.store.replay_adoption(a)["consistent"])
+
+    def test_legacy_database_is_migrated(self):
+        # Simulate a pre-diagnosis database: attempts without the new columns.
+        legacy = tempfile.mkdtemp(prefix="farm-legacy-")
+        try:
+            import sqlite3
+            conn = sqlite3.connect(os.path.join(legacy, "farm.db"))
+            conn.executescript(
+                "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY,"
+                " task_key TEXT NOT NULL, worker_id TEXT NOT NULL,"
+                " lease_expires REAL NOT NULL, state TEXT NOT NULL,"
+                " reported_at REAL, error TEXT, created_at REAL NOT NULL);"
+            )
+            conn.commit()
+            conn.close()
+            store = FarmStore(legacy)
+            try:
+                cols = {
+                    r["name"] for r in store._conn.execute(
+                        "PRAGMA table_info(attempts)").fetchall()
+                }
+                self.assertTrue(
+                    {"generation", "phase", "render_ms", "worker_meta"} <= cols)
+            finally:
+                store.close()
+        finally:
+            shutil.rmtree(legacy, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

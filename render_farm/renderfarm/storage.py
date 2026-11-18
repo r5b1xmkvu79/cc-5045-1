@@ -78,9 +78,36 @@ CREATE TABLE IF NOT EXISTS attempts (
     state TEXT NOT NULL,
     reported_at REAL,
     error TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL DEFAULT 'claim',
+    render_ms REAL,
+    worker_meta TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_key);
+CREATE TABLE IF NOT EXISTS adoptions (
+    adoption_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    frame INTEGER NOT NULL,
+    scene_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    settings_hash TEXT NOT NULL,
+    frame_revision TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    blob_sha TEXT,
+    width INTEGER,
+    height INTEGER,
+    decision TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    reason TEXT,
+    evidence TEXT NOT NULL,
+    decided_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_adoptions_task ON adoptions(task_key, decided_at);
+CREATE INDEX IF NOT EXISTS idx_adoptions_sub ON adoptions(submission_id, decided_at);
 CREATE TABLE IF NOT EXISTS blobs (
     sha256 TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -127,7 +154,25 @@ class FarmStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring pre-diagnosis databases up to the traceability schema."""
+        for table, column, decl in (
+            ("attempts", "generation", "INTEGER NOT NULL DEFAULT 0"),
+            ("attempts", "phase", "TEXT NOT NULL DEFAULT 'claim'"),
+            ("attempts", "render_ms", "REAL"),
+            ("attempts", "worker_meta", "TEXT"),
+        ):
+            existing = {
+                r["name"] for r in
+                self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -147,6 +192,122 @@ class FarmStore:
         d = dict(row)
         d["settings"] = json.loads(d.pop("settings_json"))
         return d
+
+    def _generation(self, task_key: str) -> int:
+        row = self._conn.execute(
+            "SELECT attempt_count FROM tasks WHERE task_key=?", (task_key,)
+        ).fetchone()
+        return int(row["attempt_count"]) if row else 0
+
+    def _record_adoption(self, *, task: sqlite3.Row, attempt_id: str,
+                         worker_id: str, generation: int, decision: str,
+                         stage: str, reason: Optional[str], now: float,
+                         observed: dict,
+                         blob_sha: Optional[str] = None,
+                         width: Optional[int] = None,
+                         height: Optional[int] = None) -> int:
+        """Persist a self-contained snapshot of one adoption decision.
+
+        ``observed`` is captured *before* the decision mutates any row, so
+        the snapshot is exactly the input the rule saw.  The same fields are
+        re-checked by ``diagnostics.replay_adoption`` without touching the
+        database, making every verdict independently replayable.
+        """
+        evidence = {
+            "rule": "accept only when the observed attempt was active and"
+                    " owned by the reporter, the observed task was leased to"
+                    " that worker, the attempt generation equalled the live"
+                    " lease generation and the payload validated",
+            "task_key": task["task_key"],
+            "frame_revision": identity.frame_revision(
+                task["scene_id"], task["version"], task["frame"],
+                task["settings_hash"]),
+            "submission_id": task["submission_id"],
+            "frame": task["frame"],
+            "version": task["version"],
+            "settings_hash": task["settings_hash"],
+            "attempt": {
+                "attempt_id": attempt_id,
+                "worker_id": worker_id,
+                "generation": generation,
+                "observed_state": observed.get("attempt_state"),
+                "observed_phase": observed.get("attempt_phase"),
+                "observed_worker": observed.get("attempt_worker"),
+            },
+            "task": {
+                "status": observed.get("task_status"),
+                "lease_owner": observed.get("lease_owner"),
+                "generation": observed.get("task_generation"),
+            },
+            "validation_ok": observed.get("validation_ok"),
+            "expected": {"width": width, "height": height},
+            "decided_at": now,
+        }
+        cur = self._conn.execute(
+            "INSERT INTO adoptions(task_key, submission_id, frame, scene_id,"
+            " version, settings_hash, frame_revision, attempt_id, worker_id,"
+            " generation, blob_sha, width, height, decision, stage, reason,"
+            " evidence, decided_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task["task_key"], task["submission_id"], task["frame"],
+             task["scene_id"], task["version"], task["settings_hash"],
+             evidence["frame_revision"], attempt_id, worker_id, generation,
+             blob_sha, width, height, decision, stage, reason,
+             json.dumps(evidence, ensure_ascii=False, sort_keys=True), now),
+        )
+        return int(cur.lastrowid)
+
+    def adoptions_for_task(self, task_key: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM adoptions WHERE task_key=? ORDER BY decided_at,"
+            " adoption_id", (task_key,)
+        ).fetchall()
+        return [self._adoption_view(r) for r in rows]
+
+    def adoptions_for_submission(self, submission_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM adoptions WHERE submission_id=? ORDER BY decided_at,"
+            " adoption_id", (submission_id,)
+        ).fetchall()
+        return [self._adoption_view(r) for r in rows]
+
+    def get_adoption(self, adoption_id: int) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM adoptions WHERE adoption_id=?", (adoption_id,)
+        ).fetchone()
+        return self._adoption_view(row) if row else None
+
+    @staticmethod
+    def _adoption_view(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        try:
+            d["evidence"] = json.loads(d["evidence"])
+        except (TypeError, json.JSONDecodeError):
+            pass
+        return d
+
+    @staticmethod
+    def replay_adoption(record: dict) -> dict:
+        from .diagnostics import replay_adoption as _replay
+        return _replay(record)
+
+    def attempt_trace(self, task_key: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT attempt_id, worker_id, state, phase, generation,"
+            " lease_expires, render_ms, reported_at, error, created_at,"
+            " worker_meta FROM attempts WHERE task_key=? ORDER BY created_at,"
+            " generation", (task_key,)
+        ).fetchall()
+        attempts = [dict(r) for r in rows]
+        adopted = {
+            a["attempt_id"] for a in self._conn.execute(
+                "SELECT attempt_id FROM adoptions WHERE task_key=?"
+                " AND decision='accepted'", (task_key,)
+            ).fetchall()
+        }
+        for a in attempts:
+            a["adopted"] = a["attempt_id"] in adopted
+        return attempts
 
     # -------------------------------------------------------------- submission
     def create_submission(
@@ -242,7 +403,8 @@ class FarmStore:
                 (now, submission_id),
             )
             self._conn.execute(
-                "UPDATE attempts SET state='superseded', reported_at=?"
+                "UPDATE attempts SET state='superseded', reported_at=?,"
+                " phase='cancelled'"
                 " WHERE state='active'"
                 " AND task_key IN (SELECT task_key FROM tasks WHERE submission_id=?)",
                 (now, submission_id),
@@ -351,12 +513,13 @@ class FarmStore:
             tkey = row["task_key"]
             if row["status"] == "leased":
                 self._conn.execute(
-                    "UPDATE attempts SET state='superseded', reported_at=?"
-                    " WHERE task_key=? AND state='active'",
+                    "UPDATE attempts SET state='superseded', reported_at=?,"
+                    " phase='lease_expired' WHERE task_key=? AND state='active'",
                     (now, tkey),
                 )
                 self._event("lease_expired", {"task_key": tkey,
-                                              "old_owner": row["lease_owner"]})
+                                              "old_owner": row["lease_owner"],
+                                              "old_generation": self._generation(tkey)})
             expires = now + lease_seconds
             self._conn.execute(
                 "UPDATE tasks SET status='leased', lease_owner=?,"
@@ -364,10 +527,12 @@ class FarmStore:
                 " updated_at=? WHERE task_key=?",
                 (worker_id, expires, now, tkey),
             )
+            generation = self._generation(tkey)
             self._conn.execute(
                 "INSERT INTO attempts(attempt_id, task_key, worker_id,"
-                " lease_expires, state, created_at) VALUES (?,?,?,?, 'active', ?)",
-                (attempt_id, tkey, worker_id, expires, now),
+                " lease_expires, state, created_at, generation, phase)"
+                " VALUES (?,?,?,?, 'active', ?, ?, 'claim')",
+                (attempt_id, tkey, worker_id, expires, now, generation),
             )
             self._conn.execute(
                 "UPDATE workers SET last_seen=?, current_attempt=?, current_task=?"
@@ -421,8 +586,9 @@ class FarmStore:
             for r in rows:
                 tkey = r["task_key"]
                 self._conn.execute(
-                    "UPDATE attempts SET state='superseded', reported_at=?"
-                    " WHERE task_key=? AND state='active'", (now, tkey),
+                    "UPDATE attempts SET state='superseded', reported_at=?,"
+                    " phase='reaped' WHERE task_key=? AND state='active'",
+                    (now, tkey),
                 )
                 if r["attempt_count"] >= r["max_attempts"]:
                     new_status, err = "failed", "max attempts reached"
@@ -472,40 +638,113 @@ class FarmStore:
         return sha
 
     def succeed_attempt(self, attempt_id: str, worker_id: str, blob: bytes,
-                        now: Optional[float] = None) -> str:
-        """Commit a rendered image. Returns 'ok', 'stale' or 'invalid'."""
+                        now: Optional[float] = None,
+                        render_ms: Optional[float] = None,
+                        worker_meta: Optional[dict] = None) -> str:
+        """Commit a rendered image. Returns 'ok', 'stale' or 'invalid'.
+
+        Every outcome — accepted or refused — is written as an adoption
+        decision row whose snapshot can be replayed independently.
+        """
         now = now if now is not None else time.time()
         with self._lock:
             att = self._conn.execute(
                 "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)
             ).fetchone()
-            if att is None or att["state"] != "active" or att["worker_id"] != worker_id:
-                self._event("report_rejected", {"attempt_id": attempt_id,
-                                                "worker_id": worker_id,
-                                                "reason": "stale"})
+            if att is None:
                 self._conn.commit()
                 return "stale"
             task = self._conn.execute(
                 "SELECT * FROM tasks WHERE task_key=?", (att["task_key"],)
             ).fetchone()
+            # Snapshot the state the decision rule is about to judge, before
+            # any row is mutated, so the evidence stays replayable.
+            observed = {
+                "attempt_state": att["state"],
+                "attempt_phase": att["phase"],
+                "attempt_worker": att["worker_id"],
+                "task_status": task["status"] if task else None,
+                "lease_owner": task["lease_owner"] if task else None,
+                "task_generation": (self._generation(task["task_key"])
+                                    if task else None),
+            }
+            if att["state"] != "active" or att["worker_id"] != worker_id:
+                if task is None:
+                    self._conn.commit()
+                    return "stale"
+                # Keep the phase where the attempt actually ended (e.g.
+                # 'reaped'); overwriting it here would hide the cause.
+                self._record_adoption(
+                    task=task, attempt_id=attempt_id, worker_id=worker_id,
+                    generation=int(att["generation"]), decision="refused",
+                    stage="report", now=now, observed=observed,
+                    reason=f"attempt_state={att['state']}"
+                           f"; reporter={worker_id}; owner={att['worker_id']}",
+                )
+                self._event("report_rejected", {"attempt_id": attempt_id,
+                                                "worker_id": worker_id,
+                                                "reason": "stale"})
+                self._conn.commit()
+                return "stale"
             if task is None or task["status"] != "leased" or task["lease_owner"] != worker_id:
+                # Record the stage the attempt had already reached instead of
+                # relabelling it as a plain report rejection.
                 self._conn.execute(
-                    "UPDATE attempts SET state='superseded', reported_at=?",
+                    "UPDATE attempts SET state='superseded', reported_at=?"
+                    " WHERE attempt_id=?",
                     (now, attempt_id),
+                )
+                self._record_adoption(
+                    task=task, attempt_id=attempt_id, worker_id=worker_id,
+                    generation=int(att["generation"]), decision="refused",
+                    stage="lease_check", now=now, observed=observed,
+                    reason=f"task_status={task['status'] if task else None};"
+                           f" lease_owner={task['lease_owner'] if task else None}",
                 )
                 self._event("report_rejected", {"attempt_id": attempt_id,
                                                 "reason": "task_not_leased"})
                 self._conn.commit()
                 return "stale"
+            generation = observed["task_generation"]
+            if generation != int(att["generation"]):                # A fresh generation was issued while this report was in
+                # flight; adopting it would let an old worker overwrite the
+                # newer lease's result.
+                self._conn.execute(
+                    "UPDATE attempts SET state='superseded', reported_at=?,"
+                    " phase='report' WHERE attempt_id=?",
+                    (now, attempt_id),
+                )
+                self._record_adoption(
+                    task=task, attempt_id=attempt_id, worker_id=worker_id,
+                    generation=int(att["generation"]), decision="refused",
+                    stage="generation_check", now=now, observed=observed,
+                    reason=f"attempt generation {att['generation']} !="
+                           f" live task generation {generation}",
+                )
+                self._event("report_rejected", {
+                    "attempt_id": attempt_id,
+                    "reason": "generation_mismatch",
+                    "attempt_generation": int(att["generation"]),
+                    "task_generation": generation,
+                })
+                self._conn.commit()
+                return "stale"
             settings = json.loads(task["settings_json"])
+            self._conn.execute(
+                "UPDATE attempts SET phase='validate', render_ms=?,"
+                " worker_meta=? WHERE attempt_id=?",
+                (render_ms, json.dumps(worker_meta, sort_keys=True)
+                 if worker_meta else None, attempt_id),
+            )
             try:
                 sha = self._validate_and_store(
                     blob, int(settings["width"]), int(settings["height"]), now
                 )
             except InvalidImage as exc:
                 self._conn.execute(
-                    "UPDATE attempts SET state='failed', reported_at=?, error=?",
-                    (now, str(exc)),
+                    "UPDATE attempts SET state='failed', reported_at=?, error=?,"
+                    " phase='validate' WHERE attempt_id=?",
+                    (now, str(exc), attempt_id),
                 )
                 self._return_task_to_queue(task, now, f"invalid image: {exc}")
                 self._conn.execute(
@@ -513,11 +752,21 @@ class FarmStore:
                     " current_attempt=NULL, current_task=NULL WHERE worker_id=?",
                     (now, worker_id),
                 )
+                self._record_adoption(
+                    task=task, attempt_id=attempt_id, worker_id=worker_id,
+                    generation=generation, decision="refused",
+                    stage="validate", now=now,
+                    observed=dict(observed, validation_ok=False),
+                    width=int(settings["width"]),
+                    height=int(settings["height"]),
+                    reason=f"image validation failed: {exc}",
+                )
                 self._event("invalid_image", {"task_key": task["task_key"],
                                                "attempt_id": attempt_id,
                                                "error": str(exc)})
                 self._conn.commit()
                 return "invalid"
+            validated = dict(observed, validation_ok=True)
             self._conn.execute(
                 "UPDATE tasks SET status='succeeded', blob_sha=?, width=?,"
                 " height=?, completed_at=?, lease_owner=NULL, lease_expires=NULL,"
@@ -526,7 +775,8 @@ class FarmStore:
                  task["task_key"]),
             )
             self._conn.execute(
-                "UPDATE attempts SET state='succeeded', reported_at=? WHERE attempt_id=?",
+                "UPDATE attempts SET state='succeeded', reported_at=?,"
+                " phase='adopt' WHERE attempt_id=?",
                 (now, attempt_id),
             )
             self._conn.execute(
@@ -534,13 +784,24 @@ class FarmStore:
                 " current_attempt=NULL, current_task=NULL WHERE worker_id=?",
                 (now, worker_id),
             )
+            adoption_id = self._record_adoption(
+                task=task, attempt_id=attempt_id, worker_id=worker_id,
+                generation=generation, decision="accepted", stage="adopt",
+                now=now, observed=validated, blob_sha=sha,
+                width=int(settings["width"]),
+                height=int(settings["height"]), reason=None,
+            )
             self._event("succeed", {"task_key": task["task_key"],
-                                    "attempt_id": attempt_id, "blob": sha})
+                                    "attempt_id": attempt_id, "blob": sha,
+                                    "adoption_id": adoption_id,
+                                    "generation": generation})
             self._conn.commit()
             return "ok"
 
     def fail_attempt(self, attempt_id: str, worker_id: str, error: str,
-                     now: Optional[float] = None) -> str:
+                     now: Optional[float] = None,
+                     render_ms: Optional[float] = None,
+                     worker_meta: Optional[dict] = None) -> str:
         now = now if now is not None else time.time()
         with self._lock:
             att = self._conn.execute(
@@ -553,8 +814,12 @@ class FarmStore:
                 "SELECT * FROM tasks WHERE task_key=?", (att["task_key"],)
             ).fetchone()
             self._conn.execute(
-                "UPDATE attempts SET state='failed', reported_at=?, error=?"
-                " WHERE attempt_id=?", (now, error[:500], attempt_id),
+                "UPDATE attempts SET state='failed', reported_at=?, error=?,"
+                " phase='report', render_ms=COALESCE(?, render_ms),"
+                " worker_meta=COALESCE(?, worker_meta) WHERE attempt_id=?",
+                (now, error[:500], render_ms,
+                 json.dumps(worker_meta, sort_keys=True) if worker_meta else None,
+                 attempt_id),
             )
             if task is not None and task["status"] == "leased" and task["lease_owner"] == worker_id:
                 self._return_task_to_queue(task, now, error[:500])

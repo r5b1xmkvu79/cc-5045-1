@@ -24,6 +24,7 @@ from typing import Any
 from .placeholders import placeholder_png
 from .renderer import DEFAULT_SETTINGS
 from .storage import FarmStore, InvalidImage, StaleLease
+from . import diagnostics
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_SCENE_PATH = os.path.join(_HERE, "..", "examples", "scene_bounce.json")
@@ -136,6 +137,13 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
                 tasks = store.list_tasks(sub_id)
                 for t in tasks:
                     t["provenance"] = store.task_provenance(t["task_key"])
+                    attempts = store.attempt_trace(t["task_key"])
+                    adoptions = store.adoptions_for_task(t["task_key"])
+                    t["chain"] = diagnostics.diagnose_chain(
+                        t, attempts, adoptions)
+                    # bounded payload: the panel only shows recent decisions;
+                    # full history lives on /frames/{n}/diagnostics
+                    t["recent_adoptions"] = adoptions[-5:]
                 return self._json(200, {
                     "submission": sub,
                     "summary": store.summary(sub_id),
@@ -143,7 +151,42 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
                 })
             if len(parts) == 6 and parts[4] == "frames":
                 return self._get_frame(sub_id, int(parts[5]))
+            if len(parts) == 6 and parts[4] == "diagnostics":
+                return self._get_diagnostics(sub_id, parts[5])
+            if len(parts) == 7 and parts[4] == "frames" and parts[6] == "diagnostics":
+                return self._get_frame_diagnostics(sub_id, int(parts[5]))
             self._error(404, "not found")
+
+        def _get_diagnostics(self, sub_id: str, kind: str) -> None:
+            if kind != "adoptions":
+                return self._error(404, "unknown diagnostic")
+            if not store.get_submission(sub_id):
+                return self._error(404, "unknown submission")
+            adoptions = store.adoptions_for_submission(sub_id)
+            return self._json(200, {
+                "submission_id": sub_id,
+                "adoptions": adoptions,
+                "replayed": [diagnostics.replay_adoption(a) for a in adoptions],
+            })
+
+        def _get_frame_diagnostics(self, sub_id: str, frame: int) -> None:
+            tasks = store.list_tasks(sub_id)
+            task = next((t for t in tasks if t["frame"] == frame), None)
+            if not task:
+                return self._error(404, "frame not in submission")
+            attempts = store.attempt_trace(task["task_key"])
+            adoptions = store.adoptions_for_task(task["task_key"])
+            chain = diagnostics.diagnose_chain(task, attempts, adoptions)
+            return self._json(200, {
+                "frame": frame,
+                "task_key": task["task_key"],
+                "status": task["status"],
+                "blob_sha": task["blob_sha"],
+                "frame_revision": chain["frame_revision"],
+                "attempts": attempts,
+                "adoptions": adoptions,
+                "chain": chain,
+            })
 
         def _get_frame(self, sub_id: str, frame: int) -> None:
             for t in store.list_tasks(sub_id):
@@ -159,6 +202,9 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
                         "X-Worker-Id": prov["completed_by"] or "",
                         "X-Attempt-Id": prov["completed_attempt"] or "",
                         "X-Blob-Sha256": t["blob_sha"],
+                        "X-Frame-Revision": diagnostics.revision_of(t) or "",
+                        "X-Scene-Version": t["version"],
+                        "X-Settings-Hash": t["settings_hash"],
                     })
                 w = int(t["settings"]["width"])
                 h = int(t["settings"]["height"])
@@ -166,7 +212,9 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
                 if status == "leased":
                     status = "retrying" if t["attempt_count"] > 1 else "leased"
                 return self._png(200, placeholder_png(w, h, status),
-                                 {"X-Frame-Status": t["status"]})
+                                 {"X-Frame-Status": t["status"],
+                                  "X-Frame-Revision":
+                                      diagnostics.revision_of(t) or ""})
             self._error(404, "frame not in submission")
 
         def _get_blob(self, sha: str) -> None:
@@ -241,8 +289,24 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
             worker_id = self.headers.get("X-Worker-Id", "")
             length = int(self.headers.get("Content-Length", 0))
             blob = self.rfile.read(length) if length else b""
+            render_ms = None
+            raw_ms = self.headers.get("X-Render-Ms", "")
+            if raw_ms:
+                try:
+                    render_ms = float(raw_ms)
+                except ValueError:
+                    render_ms = None
+            worker_meta = None
+            raw_meta = self.headers.get("X-Worker-Meta", "")
+            if raw_meta:
+                try:
+                    worker_meta = json.loads(raw_meta)
+                except json.JSONDecodeError:
+                    worker_meta = {"raw": raw_meta[:200]}
             try:
-                outcome = store.succeed_attempt(attempt_id, worker_id, blob)
+                outcome = store.succeed_attempt(
+                    attempt_id, worker_id, blob,
+                    render_ms=render_ms, worker_meta=worker_meta)
             except InvalidImage as exc:
                 return self._error(422, str(exc))
             if outcome == "stale":
@@ -254,8 +318,11 @@ def make_handler(store: FarmStore) -> type[BaseHTTPRequestHandler]:
         def _fail(self, path: str) -> None:
             attempt_id = path.split("/")[-2]
             body = self._read_json()
+            render_ms = body.get("render_ms")
             outcome = store.fail_attempt(attempt_id, body["worker_id"],
-                                         str(body.get("error", "unknown")))
+                                         str(body.get("error", "unknown")),
+                                         render_ms=render_ms,
+                                         worker_meta=body.get("meta"))
             if outcome == "stale":
                 return self._error(409, "attempt superseded; failure ignored")
             self._json(200, {"ok": True})
@@ -332,6 +399,25 @@ _PANEL_HTML = """<!doctype html>
   td,th { text-align:left; padding:4px 6px; border-bottom:1px solid #232c40; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
   .dot.on { background:#43d17a; } .dot.off { background:#6b7280; }
+  .tile.bad { border-color:#a23a3a; }
+  .b-ok { background:#1f4a2e; color:#b9e8c9; }
+  .b-warn { background:#5c4423; color:#ffe3b0; }
+  .b-err { background:#6e2f38; color:#ffc3c3; }
+  .diag { margin-top:8px; border-top:1px solid #283044; padding-top:8px; }
+  .diag h3 { font-size:12px; margin:0 0 6px; color:#9fc1ff; }
+  .diag .kv { display:grid; grid-template-columns:110px 1fr; gap:2px 8px; font-size:11px; }
+  .diag .kv dt { color:#8fa0ba; }
+  .diag .kv dd { margin:0; color:#d7dce5; word-break:break-all; }
+  .chain { display:flex; flex-wrap:wrap; gap:4px; margin:6px 0; }
+  .stage { padding:1px 8px; border-radius:99px; font-size:10px; background:#26314a; }
+  .stage.hit { background:#3d5d8a; color:#e2eeff; }
+  .stage.bad { background:#6e2f38; color:#ffc3c3; }
+  .anom { margin:4px 0; padding:5px 7px; border-radius:5px; background:#3a1d22;
+          color:#ffc3c3; font-size:11px; }
+  .lock { margin-top:6px; font-size:11px; color:#8fa0ba; }
+  .lock.ok { color:#9be3b4; } .lock.err { color:#ffb4b4; }
+  .adopt-row { font-size:10.5px; color:#9aa4b5; border-top:1px dotted #2a3346;
+               padding-top:3px; margin-top:3px; }
 </style>
 </head>
 <body>
@@ -382,14 +468,32 @@ _PANEL_HTML = """<!doctype html>
     <h2>4 · 帧缩略图与结果归属（来源 worker / 尝试 / 版本 / 设置哈希）</h2>
     <div class="grid" id="grid"></div>
   </div>
+  <div class="card">
+    <h2>5 · 渲染归属诊断（执行证据链 · 可独立重放）</h2>
+    <div id="diagBox"><div class="lock">点击任意帧的“归属诊断”查看该帧的阶段定位与采用决策。</div></div>
+  </div>
 </section>
 </main>
+<div id="errBar" class="feedback err" style="position:fixed;bottom:12px;left:20px;right:20px;
+     z-index:9;display:none"></div>
 <script>
 const $ = id => document.getElementById(id);
 let currentSub = null, playTimer = null;
+let selectedFrame = null, lastDiagKey = null;
 
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function fb(msg, ok) { const el = $('fb'); el.textContent = msg; el.className = 'feedback ' + (ok ? 'ok' : 'err'); }
 function clearFb() { $('fb').className = 'feedback'; }
+function showErr(msg) {
+  const el = $('errBar');
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(showErr._t);
+  showErr._t = setTimeout(() => { el.style.display = 'none'; }, 8000);
+}
 
 $('btnSample').onclick = async () => {
   const doc = await fetch('/api/sample-scene').then(r => r.json());
@@ -427,67 +531,133 @@ async function cancelSub(id, btn) {
   const r = await fetch('/api/submissions/' + id + '/cancel', {method: 'DELETE'});
   if (!r.ok) { fb('取消失败：' + (await r.json()).error, false); btn.disabled = false; }
   await refresh();
-}
-
-function statusBadge(s) { return '<span class="badge b-' + s + '">' + s + '</span>'; }
-
-async function refresh() {
-  const subs = await fetch('/api/submissions').then(r => r.json());
-  const box = $('subs'); box.innerHTML = '';
-  if (subs.length && !currentSub) currentSub = subs[0].submission_id;
-  for (const s of subs) {
-    const div = document.createElement('div');
-    div.className = 'sub';
-    div.innerHTML = '<span class="id">' + s.submission_id + '</span>' +
-      '<span class="pill ' + s.status + '">' + s.status + '</span>' +
-      '<div>场景 ' + s.scene_id + ' · 版本 <span class="mono">' + s.version + '</span></div>' +
-      '<div>帧 ' + s.frame_start + '–' + s.frame_end + ' · 设置 ' +
-      '<span class="mono">' + s.settings_hash + '</span></div>';
-    const btns = document.createElement('div');
-    const open = document.createElement('button');
-    open.textContent = '查看结果'; open.className = 'ghost';
-    open.onclick = () => { currentSub = s.submission_id; loadDetail(); };
-    div.appendChild(open);
-    if (s.status === 'open') {
-      const c = document.createElement('button');
-      c.textContent = '取消任务'; c.className = 'danger';
-      c.onclick = e => cancelSub(s.submission_id, e.target);
-      div.appendChild(c);
-    }
-    box.appendChild(div);
+  // show, right where the task is listed, which frames were kept vs cancelled
+  // and who produced the rendered ones
+  currentSub = id;
+  try {
+    const d = await fetch('/api/submissions/' + id).then(x => x.json());
+    const rows = (d.tasks || []).map(t => {
+      const p = t.provenance || {};
+      const ch = t.chain || {};
+      return '帧 ' + String(t.frame).padStart(3,'0') + ' · ' + t.status +
+        ' · 渲染帧 ' + (t.status === 'succeeded' ? '正式' : '占位') +
+        ' · 结果归属 ' + (p.completed_by || '—') +
+        (ch.adopted_generation != null ? ' · 代次 ' + ch.adopted_generation : '') +
+        ' · 原因 ' + (t.status === 'succeeded' ? '取消前已完成，保留'
+                       : t.status === 'cancelled' ? '取消时未完成，已置占位'
+                       : (t.last_error || t.status));
+    });
+    fb('已取消 ' + id + '\n' + rows.join('\n'), true);
+  } catch (e) {
+    showErr('取消后归属查询失败：' + e);
   }
-  const ws = await fetch('/api/workers').then(r => r.json());
-  $('workers').querySelector('tbody').innerHTML = ws.map(w =>
-    '<tr><td>' + w.name + '<div class="mono">' + w.worker_id.slice(0,10) + '</div></td>' +
-    '<td><span class="dot ' + (w.online ? 'on' : 'off') + '"></span>' +
-    (w.online ? '在线' : '失联') + '</td><td>' + w.completed + '</td><td>' + w.failed + '</td></tr>'
-  ).join('') || '<tr><td colspan=4>暂无工作进程</td></tr>';
-  const evs = await fetch('/api/events?limit=20').then(r => r.json());
-  $('events').innerHTML = evs.map(e =>
-    '<div>' + new Date(e.ts * 1000).toLocaleTimeString() + ' ' + e.kind +
-    ' ' + (e.detail ? JSON.stringify(e.detail) : '') + '</div>').join('');
   await loadDetail();
 }
 
+function statusBadge(s) { return '<span class="badge b-' + esc(s) + '">' + esc(s) + '</span>'; }
+
+async function refresh() {
+  try {
+    const subs = await fetch('/api/submissions').then(r => r.json());
+    const box = $('subs'); box.innerHTML = '';
+    if (subs.length && !currentSub) currentSub = subs[0].submission_id;
+    for (const s of subs) {
+      const div = document.createElement('div');
+      div.className = 'sub';
+      div.innerHTML = '<span class="id">' + esc(s.submission_id) + '</span>' +
+        '<span class="pill ' + esc(s.status) + '">' + esc(s.status) + '</span>' +
+        '<div>场景 ' + esc(s.scene_id) + ' · 版本 <span class="mono">' + esc(s.version) + '</span></div>' +
+        '<div>帧 ' + esc(s.frame_start) + '–' + esc(s.frame_end) + ' · 设置 ' +
+        '<span class="mono">' + esc(s.settings_hash) + '</span></div>';
+      const btns = document.createElement('div');
+      const open = document.createElement('button');
+      open.textContent = '查看结果'; open.className = 'ghost';
+      open.onclick = () => { currentSub = s.submission_id; selectedFrame = null;
+                             loadDetail(); };
+      div.appendChild(open);
+      if (s.status === 'open') {
+        const c = document.createElement('button');
+        c.textContent = '取消任务'; c.className = 'danger';
+        c.onclick = e => cancelSub(s.submission_id, e.target);
+        div.appendChild(c);
+      }
+      box.appendChild(div);
+    }
+    const ws = await fetch('/api/workers').then(r => r.json());
+    $('workers').querySelector('tbody').innerHTML = ws.map(w =>
+      '<tr><td>' + esc(w.name) + '<div class="mono">' + esc(w.worker_id.slice(0,10)) + '</div></td>' +
+      '<td><span class="dot ' + (w.online ? 'on' : 'off') + '"></span>' +
+      (w.online ? '在线' : '失联') + '</td><td>' + esc(w.completed) + '</td><td>' + esc(w.failed) + '</td></tr>'
+    ).join('') || '<tr><td colspan=4>暂无工作进程</td></tr>';
+    const evs = await fetch('/api/events?limit=20').then(r => r.json());
+    $('events').innerHTML = evs.map(e =>
+      '<div>' + new Date(e.ts * 1000).toLocaleTimeString() + ' ' + esc(e.kind) +
+      ' ' + esc(e.detail ? JSON.stringify(e.detail) : '') + '</div>').join('');
+    await loadDetail();
+  } catch (e) {
+    showErr('面板刷新失败：' + e);
+  }
+}
+
+function chainStrip(chain) {
+  const phases = ['claim', 'render', 'report', 'validate', 'adopt'];
+  const hit = new Set(chain.phases_seen || []);
+  const bad = new Set(Object.keys(chain.refused_by_stage || {}));
+  return '<div class="chain">' + phases.map(p =>
+    '<span class="stage' + (hit.has(p) ? ' hit' : '') +
+    (bad.has(p) ? ' bad' : '') + '">' + p + '</span>').join('') + '</div>';
+}
+
+function chainSummary(chain) {
+  if (!chain) return '';
+  const anomalies = (chain.anomalies || []);
+  const cls = anomalies.length ? 'err' : 'ok';
+  const who = chain.adopted_worker || '—';
+  const gen = chain.adopted_generation == null ? '—' : chain.adopted_generation;
+  return '<div class="lock ' + cls + '">归属：' + esc(who) +
+    ' · 代次 ' + esc(gen) + ' · 尝试 ' + esc(chain.attempt_count) +
+    ' · 被取代 ' + esc(chain.superseded_attempts) +
+    (anomalies.length ? ' · 异常 ' + anomalies.length : ' · 归属一致') + '</div>' +
+    chainStrip(chain);
+}
+
 async function loadDetail() {
-  if (!currentSub) { $('grid').innerHTML = '<div>暂无提交</div>'; $('strip').innerHTML = ''; return; }
+  if (!currentSub) {
+    $('grid').innerHTML = '<div>暂无提交</div>'; $('strip').innerHTML = '';
+    $('diagBox').innerHTML = '';
+    return;
+  }
   const r = await fetch('/api/submissions/' + currentSub);
   if (!r.ok) { currentSub = null; return; }
   const { submission, summary, tasks } = await r.json();
   const sumText = Object.entries(summary).map(([k,v]) => k + ':' + v).join('  ');
   const bust = '?t=' + Date.now();
+  const anomalies = tasks.flatMap(t => (t.chain && t.chain.anomalies || [])
+      .map(a => ({frame: t.frame, ...a})));
+  if (anomalies.length) {
+    showErr('结果归属异常：' + anomalies.slice(0, 3).map(a =>
+      '帧 ' + a.frame + ' ' + a.stage + ' ' + a.kind).join('；') +
+      (anomalies.length > 3 ? ' 等 ' + anomalies.length + ' 处' : ''));
+  }
   $('grid').innerHTML = tasks.map(t => {
     const p = t.provenance || {};
     const src = '/api/submissions/' + currentSub + '/frames/' + t.frame + bust;
-    return '<div class="tile"><img loading="lazy" src="' + src + '">' +
+    const chain = t.chain || {};
+    const bad = (chain.anomalies || []).length;
+    return '<div class="tile' + (bad ? ' bad' : '') + '"><img loading="lazy" src="' + src + '">' +
       '<div class="meta"><span class="fnum">帧 ' + String(t.frame).padStart(3,'0') +
       '</span>' + statusBadge(t.status) +
-      '<div>尝试次数 ' + t.attempt_count + (t.last_error ? ' · 最近错误 ' + t.last_error : '') + '</div>' +
-      '<div>来源 worker：' + (p.completed_by ? '<span class="mono">' + p.completed_by + '</span>' : '—') + '</div>' +
-      '<div>正式尝试：<span class="mono">' + (p.completed_attempt ? p.completed_attempt.slice(0,12) : '—') + '</span></div>' +
-      '<div>版本 <span class="mono">' + t.version + '</span> · 设置 <span class="mono">' +
-      t.settings_hash + '</span></div>' +
-      (t.blob_sha ? '<div>blob <span class="mono">' + t.blob_sha.slice(0,16) + '…</span></div>' : '') +
+      '<div>尝试次数 ' + esc(t.attempt_count) +
+      (t.last_error ? ' · 最近错误 ' + esc(t.last_error) : '') + '</div>' +
+      '<div>来源 worker：' + (p.completed_by ? '<span class="mono">' + esc(p.completed_by) + '</span>' : '—') + '</div>' +
+      '<div>正式尝试：<span class="mono">' + (p.completed_attempt ? esc(p.completed_attempt.slice(0,12)) : '—') + '</span></div>' +
+      '<div>代次 ' + esc(chain.adopted_generation == null ? '—' : chain.adopted_generation) +
+      ' · 被取代 ' + esc(chain.superseded_attempts == null ? 0 : chain.superseded_attempts) + '</div>' +
+      '<div>版本 <span class="mono">' + esc(t.version) + '</span> · 设置 <span class="mono">' +
+      esc(t.settings_hash) + '</span></div>' +
+      (t.blob_sha ? '<div>blob <span class="mono">' + esc(t.blob_sha.slice(0,16)) + '…</span></div>' : '') +
+      chainSummary(chain) +
+      '<button class="ghost" onclick="selectFrame(' + t.frame + ')">归属诊断</button>' +
       '</div></div>';
   }).join('');
   $('strip').innerHTML = tasks.map(t =>
@@ -495,7 +665,62 @@ async function loadDetail() {
     '" title="frame ' + t.frame + '"><div class="meta">帧 ' + t.frame + ' ' + statusBadge(t.status) + '</div></div>'
   ).join('');
   document.title = '渲染农场 · ' + currentSub + '（' + sumText + '）';
+  if (selectedFrame != null && tasks.some(t => t.frame === selectedFrame)) {
+    await loadDiag(selectedFrame, tasks);
+  }
 }
+
+async function loadDiag(frame, tasks) {
+  try {
+    const r = await fetch('/api/submissions/' + currentSub + '/frames/' + frame +
+                          '/diagnostics');
+    if (!r.ok) return showErr('诊断接口返回 ' + r.status);
+    const d = await r.json();
+    const chain = d.chain || {};
+    const anoms = (chain.anomalies || []);
+    const stages = Object.entries(chain.refused_by_stage || {})
+      .map(([k, v]) => k + '×' + v).join('，') || '无拒绝';
+    const rows = (d.adoptions || []).map(a => {
+      const icon = a.decision === 'accepted' ? '✓ 采用' : '✕ 拒绝';
+      return '<div class="adopt-row">' + icon + ' · 阶段 ' + esc(a.stage) +
+        ' · gen ' + esc(a.generation) + ' · ' + esc(a.worker_id) +
+        (a.reason ? ' · ' + esc(a.reason) : '') + '</div>';
+    }).join('');
+    const attemptRows = (d.attempts || []).map(a =>
+      '<div class="adopt-row">' + esc(a.state) + ' · ' + esc(a.worker_id) +
+      ' · gen ' + esc(a.generation) + ' · 阶段 ' + esc(a.phase) +
+      (a.render_ms != null ? ' · ' + Math.round(a.render_ms) + 'ms' : '') +
+      (a.adopted ? ' · <b>已采用</b>' : '') + '</div>').join('');
+    $('diagBox').innerHTML =
+      '<div class="diag"><h3>帧 ' + esc(d.frame) + ' · ' + esc(d.status) +
+      ' · 场景版本 ' + esc(d.chain && d.chain.frame_revision) + '</h3>' +
+      '<div class="lock ' + (anoms.length ? 'err' : 'ok') + '">' +
+      (anoms.length ? '定位到阶段：' + anoms.map(a => esc(a.stage) + '/' + esc(a.kind)).join('，')
+                    : '执行证据链一致，无归属异常') + '</div>' +
+      chainStrip(chain) +
+      '<div class="kv">' +
+      '<dt>正式 worker</dt><dd>' + esc(chain.adopted_worker || '—') + '</dd>' +
+      '<dt>正式代次</dt><dd>' + esc(chain.adopted_generation == null ? '—' : chain.adopted_generation) + '</dd>' +
+      '<dt>尝试数</dt><dd>' + esc(chain.attempt_count) + '</dd>' +
+      '<dt>被取代</dt><dd>' + esc(chain.superseded_attempts) + '</dd>' +
+      '<dt>拒绝分布</dt><dd>' + esc(stages) + '</dd>' +
+      '<dt>blob sha</dt><dd class="mono">' + esc(d.blob_sha || '—') + '</dd>' +
+      '</div>' +
+      '<h3 style="margin-top:10px">采用决策（可重放）</h3>' + (rows || '<div class="lock">暂无决策</div>') +
+      '<h3 style="margin-top:10px">尝试执行证据</h3>' + (attemptRows || '<div class="lock">暂无尝试</div>') +
+      '<button class="ghost" onclick="loadDiag(' + frame + ')">重新载入</button>' +
+      '</div>';
+    lastDiagKey = currentSub + ':' + frame;
+  } catch (e) {
+    showErr('归属诊断加载失败：' + e);
+  }
+}
+
+function selectFrame(frame) {
+  selectedFrame = frame;
+  return loadDiag(frame);
+}
+window.selectFrame = selectFrame;
 
 $('btnPlay').onclick = () => {
   if (playTimer) { clearInterval(playTimer); playTimer = null; $('btnPlay').textContent = '▶ 顺序预览（真实帧轮播）'; return; }
